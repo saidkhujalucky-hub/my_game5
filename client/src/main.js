@@ -1,5 +1,7 @@
 import * as THREE from 'three';
 import { io } from 'socket.io-client';
+import { createGameSocket } from './realtime.js';
+import { decorateHero } from './hero-detail.js';
 import { HEROES, MAX_PLAYERS, BASE_RADIUS, MAP_RADIUS, UPGRADE_COSTS, basePosition, clampToArena } from '../../shared/config.js';
 import './style.css';
 
@@ -274,9 +276,9 @@ createMap();
 // -----------------------------------------------------------------------------
 // SUPERHERO MODELS: original stylized low-poly rigs, unique suits and weapons.
 // -----------------------------------------------------------------------------
-function createAvatar(heroIndex,name){
+function createAvatar(heroIndex,name,target=scene){
   const hero=HEROES[heroIndex];
-  const root=new THREE.Group(),rig=new THREE.Group();root.add(rig);scene.add(root);
+  const root=new THREE.Group(),rig=new THREE.Group();root.add(rig);target.add(root);
   const main=mat(hero.color,.48,.38),dark=mat(0x182a43,.48,.42),accent=mat(hero.accent,.65,.3);
   const visor=glowMat(hero.accent,.95);
   const torso=box(1.65,2.25,.95,main,rig,0,3.2,0);torso.castShadow=true;
@@ -313,6 +315,8 @@ function createAvatar(heroIndex,name){
       const spike=cyl(0,.22,1,accent,rig,side*.48,5.85,-.07,5);spike.rotation.z=-side*.3;
     }
   }
+  // Distinct character-specific hard-surface armor, helmet, effects and silhouette.
+  decorateHero(rig,hero,heroIndex,{THREE,box,sphere,cyl,ring,mat,glowMat});
   // Held energy weapon.
   const weapon=new THREE.Group();rightArm.add(weapon);weapon.position.set(0,-1.2,.75);
   const barrel=box(.48,.46,1.95,dark,weapon,0,0,.75);barrel.castShadow=true;
@@ -335,6 +339,12 @@ function updateAvatarAppearance(obj,p,elapsed){
   obj.leftLeg.rotation.x=walk;obj.rightLeg.rotation.x=-walk;
   obj.leftArm.rotation.x=-walk*.7;obj.rightArm.rotation.x=walk*.7-.2;
   obj.root.rotation.y=p.rot||0;
+  const details=obj.rig.userData.heroDetails;
+  if(details){
+    for(const {object,speed} of details.moving)object.rotation.y=elapsed*speed;
+    details.particles.rotation.y=elapsed*.3;
+    details.core.scale.setScalar(1+Math.sin(elapsed*3.5)*.065);
+  }
   obj.shield.visible=Boolean(p.shield);
   obj.healthFront.scale.x=Math.max(.003,p.hp/p.maxHp);
   obj.healthFront.position.x=-1.86+1.86*Math.max(.003,p.hp/p.maxHp);
@@ -367,13 +377,70 @@ function createDrone(n){
 // GitHub Pages / Cloudflare Pages: задай VITE_SOCKET_URL с https-адресом Render.
 // Для Direct Upload без сборки адрес задаётся в backend-config.js.
 const backendURL = String(window.HERO_SOCKET_SERVER || import.meta.env?.VITE_SOCKET_URL || '').trim().replace(/\/$/, '');
-const staticHost = /\.pages\.dev$|\.github\.io$/.test(window.location.hostname);
-const socket=io(backendURL || undefined, {autoConnect:true,reconnection:true,reconnectionAttempts:20,timeout:12000});
+const staticHost = /\.pages\.dev$|\.github\.io$|\.workers\.dev$/.test(window.location.hostname);
+const cloudflareNative = staticHost && !backendURL;
+const realtimeEndpoint = /\.github\.io$/.test(window.location.hostname)
+  ? 'https://my-game5.saidkhujalucky.workers.dev/game-ws' : '/game-ws';
+const socket=cloudflareNative
+  ? createGameSocket(realtimeEndpoint)
+  : io(backendURL || undefined, {autoConnect:true,reconnection:true,reconnectionAttempts:20,timeout:12000});
 const state={active:false,id:null,room:null,hero:0,slot:null,players:new Map(),avatars:new Map(),npcs:new Map(),droneModels:new Map(),bullets:new Map(),effects:[],local:{x:0,z:0,rot:0},inputX:0,inputZ:0,fire:false,selected:0,camYaw:0,camPitch:.24,camDistance:20,cameraTime:0,lastMoveSend:0,lastFire:0,fxMuted:false,feedTimer:[],projectileFrames:0,localSpawnSync:false};
 const keys=new Set();
 let heroSelection=0,toastTimer;
 const mobile=window.matchMedia('(pointer:coarse)').matches;
 const selectedGlyphs=['ϟ','◆','✧','❄','✹','◈','❀','ϟ','✶','⬡','➤','✦'];
+// Live turntable for inspecting each original character's unique 3D suit.
+const showcaseScene=new THREE.Scene();
+const showcaseCamera=new THREE.PerspectiveCamera(35,1,.1,100);
+showcaseCamera.position.set(8.5,6.6,14.6);showcaseCamera.lookAt(0,3.2,0);
+showcaseScene.add(new THREE.HemisphereLight(0x97dfff,0x263b56,3.0));
+const keyLight=new THREE.DirectionalLight(0xffffff,3.1);keyLight.position.set(-6,10,10);showcaseScene.add(keyLight);
+const rimLight=new THREE.DirectionalLight(0x69aaff,3);rimLight.position.set(6,5,-9);showcaseScene.add(rimLight);
+const runway=new THREE.Mesh(new THREE.CylinderGeometry(2.35,2.65,.35,48),new THREE.MeshStandardMaterial({color:0x0b2337,metalness:.72,roughness:.25}));
+runway.position.y=.03;showcaseScene.add(runway);
+const runwayRing=new THREE.Mesh(new THREE.TorusGeometry(2.25,.045,6,70),new THREE.MeshBasicMaterial({color:0x7feeff}));
+runwayRing.rotation.x=Math.PI/2;runwayRing.position.y=.26;showcaseScene.add(runwayRing);
+let showcaseRenderer=null,showcaseActive=null;
+const showcaseModels=new Map();
+try{
+  showcaseRenderer=new THREE.WebGLRenderer({alpha:true,antialias:true,powerPreference:'low-power'});
+  showcaseRenderer.setPixelRatio(Math.min(window.devicePixelRatio||1,1.5));
+  showcaseRenderer.setSize(350,320,false);
+  showcaseRenderer.outputColorSpace=THREE.SRGBColorSpace;
+  showcaseRenderer.toneMapping=THREE.ACESFilmicToneMapping;
+  showcaseRenderer.toneMappingExposure=1.45;
+  $('heroPreviewCanvas').appendChild(showcaseRenderer.domElement);
+}catch(error){console.warn('Hero preview unavailable:',error);}
+function refreshShowcase(index){
+  const h=HEROES[index];
+  $('showcaseName').textContent=h.name;
+  $('showcaseClass').textContent=h.type.toUpperCase()+' · УНИКАЛЬНЫЙ КОСТЮМ';
+  if(!showcaseRenderer)return;
+  if(showcaseActive)showcaseActive.root.visible=false;
+  let model=showcaseModels.get(index);
+  if(!model){
+    model=createAvatar(index,'',showcaseScene);
+    model.nameTag.visible=false;model.healthBack.visible=false;model.healthFront.visible=false;
+    model.root.position.y=.25;
+    showcaseModels.set(index,model);
+  }
+  model.root.visible=true;showcaseActive=model;
+  runwayRing.material.color.setHex(h.color);
+}
+function renderShowcase(dt,time){
+  if(!showcaseRenderer||!showcaseActive||$('lobby').classList.contains('hidden'))return;
+  const element=$('heroPreviewCanvas'),w=element.clientWidth,h=element.clientHeight;
+  if(w<10||h<10)return;
+  if(showcaseRenderer.domElement.width!==Math.round(w*showcaseRenderer.getPixelRatio()) || showcaseRenderer.domElement.height!==Math.round(h*showcaseRenderer.getPixelRatio())){
+    showcaseRenderer.setSize(w,h,false);showcaseCamera.aspect=w/h;showcaseCamera.updateProjectionMatrix();
+  }
+  showcaseActive.root.rotation.y+=dt*.46;
+  showcaseActive.rig.position.y=Math.sin(time*.0019)*.12;
+  const d=showcaseActive.rig.userData.heroDetails;
+  if(d){d.moving.forEach(({object,speed})=>object.rotation.y=time*.001*speed);d.particles.rotation.y=time*.0003;}
+  runwayRing.rotation.z+=dt*.16;
+  showcaseRenderer.render(showcaseScene,showcaseCamera);
+}
 function buildHeroGrid(){
   const grid=$('heroGrid');grid.innerHTML='';
   HEROES.forEach((hero,index)=>{
@@ -386,6 +453,7 @@ function buildHeroGrid(){
 }
 function selectHero(index){heroSelection=index;[...$('heroGrid').children].forEach((el,i)=>el.classList.toggle('active',i===index));updateHeroDetail();}
 function updateHeroDetail(){
+  refreshShowcase(heroSelection);
   const h=HEROES[heroSelection];
   $('heroDetail').innerHTML=`<span class="detail-name" style="color:${colorCSS(h.color)}">${h.name}</span><span class="detail-item">⚔ <b>${h.weapon}</b></span><span class="detail-item">✧ <b>${h.ability}</b></span><span class="detail-item">♥ <b>${h.hp} HP</b></span><span class="detail-item">◉ <b>${h.speed.toFixed(1)} скорость</b></span>`;
 }
@@ -401,7 +469,7 @@ socket.on('disconnect',()=>{
   if(state.active)showToast('Потеряно соединение с сервером');
 });
 function join(){
-  if(!socket.connected){$('lobbyMessage').textContent=staticHost && !backendURL ? 'Чтобы играть онлайн на Cloudflare / GitHub Pages, подключи сервер: укажи VITE_SOCKET_URL (адрес Render).' : 'Сервер игры не отвечает. Проверь, что backend запущен.';return;}
+  if(!socket.connected){$('lobbyMessage').textContent=cloudflareNative ? 'Игровой сервер Cloudflare пока не ответил. Перезагрузи страницу.' : 'Сервер игры не отвечает. Проверь, что backend запущен.';return;}
   $('playButton').disabled=true;$('lobbyMessage').textContent='Подключение к арене…';
   const nickname=$('nickname').value.trim().slice(0,18)||'Герой';
   const room=$('roomCode').value.trim().slice(0,14)||'PUBLIC';
@@ -765,6 +833,7 @@ function animate(time){
     e.flash.scale.setScalar(1+progress*5);
     e.flash.material.opacity=.24*(1-progress);
   }
+  renderShowcase(dt,time);
   renderer.render(scene,camera);
 }
 requestAnimationFrame(animate);
