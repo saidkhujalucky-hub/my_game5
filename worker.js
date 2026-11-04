@@ -78,6 +78,8 @@ export class Arena {
     const session=this.sessions.get(ws);
     if (!session?.room) return;
     const room=this.rooms.get(session.room);
+    // Disconnect before broadcasting, otherwise a closed socket can re-enter leave().
+    session.room=null;
     if(room) {
       const p=room.players.get(session.id);
       room.players.delete(session.id);
@@ -85,7 +87,6 @@ export class Arena {
       if(!room.players.size) this.rooms.delete(room.code);
       else this.snapshot(room);
     }
-    session.room=null;
   }
   webSocketClose(ws) { this.leave(ws); this.sessions.delete(ws); this.maybeStop(); }
   webSocketError(ws) { this.leave(ws); this.sessions.delete(ws); this.maybeStop(); }
